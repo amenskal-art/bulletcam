@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status bar icons are masked to a single colour, so this is a flat silhouette:
+     an orbit ring around a solid subject. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFFFF">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,8m-3.4,0a3.4,3.4 0 1,0 6.8,0a3.4,3.4 0 1,0 -6.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,13.2c-5.2,0 -9.4,1.7 -9.4,3.9s4.2,3.9 9.4,3.9s9.4,-1.7 9.4,-3.9S17.2,13.2 12,13.2zM12,19.4c-3.9,0 -7.1,-1.1 -7.1,-2.3s3.2,-2.3 7.1,-2.3s7.1,1.1 7.1,2.3S15.9,19.4 12,19.4z" />
+</vector>

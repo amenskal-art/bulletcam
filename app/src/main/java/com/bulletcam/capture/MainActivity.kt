@@ -3,6 +3,7 @@ package com.bulletcam.capture
 import android.Manifest
 import android.content.pm.PackageManager
 import android.opengl.GLSurfaceView
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
@@ -43,8 +44,24 @@ class MainActivity : ComponentActivity(), ArSessionController.Listener {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             cameraGranted = granted
-            if (granted) startArSession()
+            if (granted) {
+                requestNotificationPermission()
+                startArSession()
+            }
         }
+
+    // Reconstruction still runs without it; the progress notification is simply
+    // suppressed, so this is asked for once and never blocks anything.
+    private val notificationLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,11 +78,25 @@ class MainActivity : ComponentActivity(), ArSessionController.Listener {
 
         cameraGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
+        if (cameraGranted) requestNotificationPermission()
 
         setContent {
             BulletCamTheme {
                 val screen by viewModel.screen.collectAsStateWithLifecycle()
                 val message by viewModel.sessionMessage.collectAsStateWithLifecycle()
+
+                // ARCore is shut down while a reconstruction runs. Holding the
+                // camera open would cost frame time and battery for a preview
+                // nobody is looking at, and competing with a saturated CPU is
+                // the fastest way to make tracking judder on the way back.
+                LaunchedEffect(screen, cameraGranted) {
+                    if (cameraGranted && screen is Screen.Capture) {
+                        startArSession()
+                    } else if (sessionStarted) {
+                        arController.pause()
+                        sessionStarted = false
+                    }
+                }
 
                 LaunchedEffect(message) {
                     message?.let {
@@ -117,7 +148,7 @@ class MainActivity : ComponentActivity(), ArSessionController.Listener {
 
     override fun onResume() {
         super.onResume()
-        if (cameraGranted) startArSession()
+        if (cameraGranted && viewModel.screen.value is Screen.Capture) startArSession()
         glSurfaceView.onResume()
     }
 

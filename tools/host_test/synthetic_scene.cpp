@@ -22,6 +22,8 @@ constexpr int kImageWidth = 480;
 constexpr int kImageHeight = 360;
 constexpr float kSphereRadius = 0.15f;
 constexpr float kOrbitRadius = 0.55f;
+constexpr float kGroundHeight = -0.16f;
+constexpr float kGroundHalfSize = 0.5f;
 
 uint32_t hash3(int x, int y, int z) {
     uint32_t h = static_cast<uint32_t>(x) * 73856093u ^ static_cast<uint32_t>(y) * 19349663u ^
@@ -30,6 +32,17 @@ uint32_t hash3(int x, int y, int z) {
     h *= 0x5bd1e995u;
     h ^= h >> 15;
     return h;
+}
+
+// Coarse tabletop pattern: matchable, but plainly not part of the subject.
+void groundColor(const Vec3& p, uint8_t rgb[3]) {
+    const int cx = static_cast<int>(std::floor(p.x * 22.f));
+    const int cz = static_cast<int>(std::floor(p.z * 22.f));
+    const uint32_t h = hash3(cx, 0, cz);
+    const float base = 70.f + static_cast<float>(h & 0x3F) * 1.4f;
+    rgb[0] = static_cast<uint8_t>(clampf(base * 0.95f, 0.f, 255.f));
+    rgb[1] = static_cast<uint8_t>(clampf(base * 0.88f, 0.f, 255.f));
+    rgb[2] = static_cast<uint8_t>(clampf(base * 0.74f, 0.f, 255.f));
 }
 
 // High frequency surface texture so the matcher has something to lock onto.
@@ -97,9 +110,23 @@ RenderedFrame render(float azimuthDeg, float elevationDeg) {
             const float c = center.squaredNorm() - kSphereRadius * kSphereRadius;
             const float disc = b * b - 4.f * c;
             uint8_t rgb[3] = {8, 8, 10};
+            float hitT = 1e30f;
             if (disc > 0.f) {
                 const float t = (-b - std::sqrt(disc)) * 0.5f;
-                if (t > 0.f) surfaceColor(center + dir * t, rgb);
+                if (t > 0.f) {
+                    hitT = t;
+                    surfaceColor(center + dir * t, rgb);
+                }
+            }
+            // A tabletop under the subject: exactly the kind of background the
+            // mask exists to throw away.
+            if (std::fabs(dir.y) > 1e-5f) {
+                const float t = (kGroundHeight - center.y) / dir.y;
+                if (t > 0.f && t < hitT) {
+                    const Vec3 hit = center + dir * t;
+                    if (std::fabs(hit.x) < kGroundHalfSize && std::fabs(hit.z) < kGroundHalfSize)
+                        groundColor(hit, rgb);
+                }
             }
             const int luma = (66 * rgb[0] + 129 * rgb[1] + 25 * rgb[2] + 128) / 256 + 16;
             const int cb = (-38 * rgb[0] - 74 * rgb[1] + 112 * rgb[2] + 128) / 256 + 128;
@@ -130,6 +157,14 @@ int main(int argc, char** argv) {
     options.poissonResolution = 112;
     options.atlasResolution = 1024;
     options.targetTriangles = 0;
+    // Masking is how the app runs; pass "nomask" to compare against the
+    // whole-scene path.
+    const bool useMask = !(argc > 2 && std::string(argv[2]) == "nomask");
+    if (useMask) {
+        options.subject.center = Vec3{0.f, 0.f, 0.f};
+        options.subject.radius = 0.175f;  // the sphere is 0.15 m, so a little slack
+    }
+    std::printf("subject mask: %s\n", useMask ? "on" : "off");
 
     FrameStore store(workDir + "/frames", options);
     ensureDirectory(workDir + "/frames");
@@ -176,6 +211,12 @@ int main(int argc, char** argv) {
     std::sort(errors.begin(), errors.end());
     const float median = errors[errors.size() / 2];
     std::printf("median radial error = %.2f mm over %zu vertices\n", median * 1000.f, errors.size());
+    if (!useMask) {
+        // The whole-scene path legitimately reconstructs the tabletop too, so
+        // the sphere tolerance does not apply. This mode is for comparison.
+        std::printf("mask disabled: skipping the subject accuracy assertion\n");
+        return 0;
+    }
     if (median > 0.003f) {
         std::printf("FAIL: median radial error above the 3 mm tolerance\n");
         return 1;

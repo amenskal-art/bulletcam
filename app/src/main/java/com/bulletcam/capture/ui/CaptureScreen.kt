@@ -126,6 +126,14 @@ fun CaptureScreen(
                 .padding(horizontal = 20.dp, vertical = 26.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            if (overlay.subjectPlaced) {
+                VolumeControl(
+                    radius = overlay.subjectRadius,
+                    onAdjust = { viewModel.adjustSubjectRadius(it) },
+                )
+                Spacer(Modifier.height(14.dp))
+            }
+
             Text(
                 overlay.lastRejectReason ?: overlay.hint,
                 style = Readout,
@@ -183,6 +191,29 @@ fun CaptureScreen(
 private fun OrbitOverlay(overlay: CaptureController.Overlay) {
     val density = LocalDensity.current
     Canvas(modifier = Modifier.fillMaxSize()) {
+        // Capture volume first, so the coverage ring reads on top of it.
+        val volume = overlay.volumePoints
+        if (volume.size >= 6) {
+            val samples = CaptureController.VOLUME_SAMPLES
+            val stroke = with(density) { 1.2.dp.toPx() }
+            for (circle in 0 until 3) {
+                for (i in 0 until samples) {
+                    val a = (circle * samples + i) * 2
+                    val b = (circle * samples + (i + 1) % samples) * 2
+                    if (a + 1 >= volume.size || b + 1 >= volume.size) continue
+                    val x0 = volume[a]; val y0 = volume[a + 1]
+                    val x1 = volume[b]; val y1 = volume[b + 1]
+                    if (x0.isNaN() || y0.isNaN() || x1.isNaN() || y1.isNaN()) continue
+                    drawLine(
+                        color = Ink.Amber.copy(alpha = 0.34f),
+                        start = Offset(x0, y0),
+                        end = Offset(x1, y1),
+                        strokeWidth = stroke,
+                    )
+                }
+            }
+        }
+
         val points = overlay.ringPoints
         val covered = overlay.ringCovered
         if (points.size >= 4 && covered.isNotEmpty()) {
@@ -249,6 +280,44 @@ private fun CoverageStrip(overlay: CaptureController.Overlay) {
                     .background(if (lit) Ink.Phosphor else Ink.Edge),
             )
         }
+    }
+}
+
+/**
+ * Sets the radius of the reconstruction volume. Everything outside it is
+ * discarded before dense stereo, so this is the single biggest lever the
+ * operator has over both runtime and how much detail lands on the object.
+ */
+@Composable
+private fun VolumeControl(radius: Float, onAdjust: (Float) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("CAPTURE VOLUME", style = Label)
+        Spacer(Modifier.width(14.dp))
+        StepButton("-") { onAdjust(-CaptureController.RADIUS_STEP) }
+        Text(
+            "  ${(radius * 200).roundToInt()} cm  ",
+            style = Readout.copy(fontSize = 13.sp),
+            color = Ink.Amber,
+        )
+        StepButton("+") { onAdjust(CaptureController.RADIUS_STEP) }
+    }
+}
+
+@Composable
+private fun StepButton(label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(RoundedCornerShape(3.dp))
+            .background(Ink.Slate.copy(alpha = 0.9f))
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, style = Readout.copy(fontSize = 16.sp), color = Ink.Bone)
     }
 }
 

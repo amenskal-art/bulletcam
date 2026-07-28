@@ -99,6 +99,7 @@ public:
         depth_ = &out.depth;
         normal_ = &out.normal;
         cost_ = &out.cost;
+        buildSubjectMask();
         initialise();
         for (int iter = 0; iter < options_.patchMatchIterations; ++iter) {
             const float shrink = std::pow(0.5f, static_cast<float>(iter));
@@ -200,6 +201,47 @@ private:
 
     // Projects the sparse cloud into this view to seed the depth search. Without
     // a prior, PatchMatch needs many more iterations to lock on.
+    // Projects the subject ball into this view once, giving every pixel either
+    // "outside, skip entirely" or a tight [near, far] depth interval. Two wins:
+    // the sweeps touch far fewer pixels, and the ones they do touch search a
+    // shell a few centimetres thick instead of the whole scene depth range.
+    void buildSubjectMask() {
+        const SubjectVolume& subject = options_.subject;
+        if (!subject.enabled()) return;
+        masked_ = true;
+        const size_t pixels = static_cast<size_t>(width_) * height_;
+        rangeNear_.assign(pixels, 0.f);
+        rangeFar_.assign(pixels, 0.f);
+
+        const Vec3 centerCam = ref_.stereoView.worldToCamera(subject.center);
+        // Work in camera space: the eye sits at the origin, so the ray origin is
+        // zero and a Pinhole ray (z == 1) makes t fall out as z-depth directly.
+        SubjectVolume local;
+        local.center = centerCam;
+        local.radius = subject.radius;
+
+        const Pinhole& k = ref_.stereoView.intrinsics;
+        parallelBlocks(height_, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                for (int x = 0; x < width_; ++x) {
+                    const Vec3 ray = k.ray(static_cast<float>(x), static_cast<float>(y));
+                    float tNear = 0.f, tFar = 0.f;
+                    if (!local.intersect(Vec3{0.f, 0.f, 0.f}, ray, tNear, tFar)) continue;
+                    const size_t idx = static_cast<size_t>(y) * width_ + x;
+                    rangeNear_[idx] = tNear;
+                    rangeFar_[idx] = tFar;
+                }
+            }
+        });
+    }
+
+    bool insideMask(size_t idx) const { return !masked_ || rangeFar_[idx] > 0.f; }
+
+    float clampToMask(size_t idx, float depth) const {
+        if (!masked_) return depth;
+        return clampf(depth, rangeNear_[idx], rangeFar_[idx]);
+    }
+
     void initialise() {
         const View& view = ref_.stereoView;
         const int stride = 8;
@@ -257,9 +299,17 @@ private:
             for (int y = y0; y < y1; ++y) {
                 for (int x = 0; x < width_; ++x) {
                     const size_t idx = static_cast<size_t>(y) * width_ + x;
+                    if (!insideMask(idx)) continue;  // background: never evaluated
                     const float prior = seed[static_cast<size_t>(y / stride) * gw + (x / stride)];
                     float d;
-                    if (prior > 0.f) {
+                    if (masked_) {
+                        // The ball already bounds the answer, so sample inside it.
+                        const float near = rangeNear_[idx];
+                        const float far = rangeFar_[idx];
+                        d = (prior > near && prior < far) ? prior * rng.uniform(0.94f, 1.06f)
+                                                         : rng.uniform(near, far);
+                        d = clampf(d, near, far);
+                    } else if (prior > 0.f) {
                         d = clampf(prior * rng.uniform(0.82f, 1.22f), dMin, dMax);
                     } else {
                         d = std::exp(rng.uniform(logMin, logMax));
@@ -309,6 +359,7 @@ private:
 
     void improve(int x, int y, int nx, int ny, float shrink) {
         const size_t idx = static_cast<size_t>(y) * width_ + x;
+        if (!insideMask(idx)) return;
         const Pinhole& k = ref_.stereoView.intrinsics;
         RefPatch patch;
         buildRefPatch(x, y, patch);
@@ -324,8 +375,9 @@ private:
             if (neighbour.depth > 1e-4f) {
                 const Vec3 nRay = k.ray(static_cast<float>(nx), static_cast<float>(ny));
                 const Plane candidate = propagate(neighbour, nRay, ownRay);
-                if (candidate.depth > ref_.depthMin * 0.5f &&
-                    candidate.depth < ref_.depthMax * 2.f) {
+                const float lowerBound = masked_ ? rangeNear_[idx] : ref_.depthMin * 0.5f;
+                const float upperBound = masked_ ? rangeFar_[idx] : ref_.depthMax * 2.f;
+                if (candidate.depth > lowerBound && candidate.depth < upperBound) {
                     const float c = planeCost(patch, candidate);
                     if (c < bestCost) {
                         bestCost = c;
@@ -340,10 +392,18 @@ private:
         const float angleRange = 0.9f * shrink;
         for (int attempt = 0; attempt < 2; ++attempt) {
             Plane candidate;
-            candidate.depth = best.depth > 1e-4f
-                                  ? best.depth + rng.uniform(-depthRange, depthRange)
-                                  : rng.uniform(ref_.depthMin, ref_.depthMax);
-            candidate.depth = clampf(candidate.depth, ref_.depthMin * 0.5f, ref_.depthMax * 2.f);
+            if (masked_) {
+                candidate.depth = best.depth > 1e-4f
+                                      ? best.depth + rng.uniform(-depthRange, depthRange)
+                                      : rng.uniform(rangeNear_[idx], rangeFar_[idx]);
+                candidate.depth = clampToMask(idx, candidate.depth);
+            } else {
+                candidate.depth = best.depth > 1e-4f
+                                      ? best.depth + rng.uniform(-depthRange, depthRange)
+                                      : rng.uniform(ref_.depthMin, ref_.depthMax);
+                candidate.depth =
+                    clampf(candidate.depth, ref_.depthMin * 0.5f, ref_.depthMax * 2.f);
+            }
             candidate.normal = best.normal.squaredNorm() > 0.5f
                                    ? perturbNormal(rng, best.normal, ownRayUnit, angleRange)
                                    : randomHemisphereNormal(rng, ownRayUnit, 1.15f);
@@ -389,6 +449,8 @@ private:
     const SparseMap& sparse_;
     std::vector<SourceContext> sources_;
     int width_ = 0, height_ = 0;
+    bool masked_ = false;
+    std::vector<float> rangeNear_, rangeFar_;
     int radius_ = 4, step_ = 2;
     uint32_t rngSalt_ = 0x2545F491u;
     std::vector<float>* depth_ = nullptr;

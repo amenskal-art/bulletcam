@@ -111,6 +111,9 @@ PointCloud fuseDepthMaps(const FrameStore& store,
                 const Vec3 cam = refView.intrinsics.unproject(static_cast<float>(x),
                                                               static_cast<float>(y), d);
                 const Vec3 world = refView.cameraToWorld(cam);
+                // Safety net for the unmasked path and for depths that drifted
+                // to the very edge of the shell.
+                if (!opt.subject.contains(world)) continue;
 
                 Vec3 normalCam{0.f, 0.f, -1.f};
                 if (hasNormals) {

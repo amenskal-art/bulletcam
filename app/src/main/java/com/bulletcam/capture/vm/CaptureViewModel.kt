@@ -6,14 +6,16 @@ import androidx.lifecycle.viewModelScope
 import com.bulletcam.capture.capture.CaptureController
 import com.bulletcam.capture.capture.OrbitCoverage
 import com.bulletcam.capture.nativebridge.NativeReconstructor
+import com.bulletcam.capture.recon.ReconstructionEngine
+import com.bulletcam.capture.recon.ReconstructionService
 import com.google.ar.core.Frame
 import com.google.ar.core.Session
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -30,12 +32,28 @@ enum class Quality { Fast, Balanced, High }
 
 class CaptureViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val reconstructor = NativeReconstructor()
+    private val reconstructor: NativeReconstructor = ReconstructionEngine.reconstructor
     private val coverage = OrbitCoverage()
     val capture = CaptureController(reconstructor, coverage)
 
-    private val _screen = MutableStateFlow<Screen>(Screen.Capture)
-    val screen: StateFlow<Screen> = _screen.asStateFlow()
+    /**
+     * Screen state is derived from the engine rather than held here, so an
+     * Activity recreated while a reconstruction is running - returning to the
+     * app from recents, or after a rotation - lands straight back on the
+     * progress screen instead of a blank capture view.
+     */
+    val screen: StateFlow<Screen> = ReconstructionEngine.state
+        .map { state ->
+            when (state) {
+                ReconstructionEngine.State.Idle -> Screen.Capture
+                is ReconstructionEngine.State.Running -> Screen.Processing(state.stage, state.fraction)
+                is ReconstructionEngine.State.Done ->
+                    Screen.Result(state.objFile, state.glbFile, state.summary)
+
+                is ReconstructionEngine.State.Failed -> Screen.Failed(state.reason)
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, Screen.Capture)
 
     private val _overlay = MutableStateFlow(CaptureController.Overlay())
     val overlay: StateFlow<CaptureController.Overlay> = _overlay.asStateFlow()
@@ -52,17 +70,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     private val _sessionMessage = MutableStateFlow<String?>(null)
     val sessionMessage: StateFlow<String?> = _sessionMessage.asStateFlow()
 
-    private var workDir: File = File(application.cacheDir, "reconstruction").apply { mkdirs() }
+    private val workDir = File(application.cacheDir, "reconstruction")
 
     init {
-        openSession()
-    }
-
-    private fun openSession() {
-        if (reconstructor.isOpen) return
-        workDir.deleteRecursively()
-        workDir.mkdirs()
-        reconstructor.open(workDir.absolutePath, optionsFor(_quality.value))
+        ReconstructionEngine.openSession(workDir, optionsFor(_quality.value))
     }
 
     private fun optionsFor(quality: Quality) = when (quality) {
@@ -72,19 +83,19 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setQuality(value: Quality) {
-        if (_quality.value == value) return
+        if (_quality.value == value || ReconstructionEngine.isRunning) return
         _quality.value = value
-        // Options are fixed for the lifetime of a native session, so restart it.
-        // Photos already taken would have been converted at the old settings.
-        reconstructor.close()
+        // Image sizes are baked into the frames already converted, so changing
+        // them means starting the photo set over.
+        ReconstructionEngine.resetSession(workDir, optionsFor(value))
         coverage.reset()
         capture.reset()
-        openSession()
+        _overlay.value = CaptureController.Overlay()
     }
 
     /** Called from the GL thread. */
     fun onArFrame(frame: Frame, session: Session, width: Int, height: Int) {
-        if (_screen.value !is Screen.Capture) return
+        if (screen.value !is Screen.Capture) return
         _overlay.value = capture.onFrame(frame, session, width, height)
     }
 
@@ -101,14 +112,19 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         _exposureLockSupported.value = supported
     }
 
+    fun adjustSubjectRadius(delta: Float) {
+        capture.adjustRadius(delta)
+    }
+
     fun discardCaptures() {
+        if (ReconstructionEngine.isRunning) return
         reconstructor.discardAll()
         capture.reset()
         _overlay.value = CaptureController.Overlay()
     }
 
     fun startReconstruction() {
-        if (_screen.value is Screen.Processing) return
+        if (ReconstructionEngine.isRunning) return
         val frames = reconstructor.frameCount()
         if (frames < CaptureController.MIN_FRAMES) {
             _sessionMessage.value =
@@ -116,46 +132,34 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             return
         }
 
+        // Make sure the mask the operator was shown is the one that gets used.
+        capture.pushSubjectVolume()
+
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val outputDir = File(getApplication<Application>().getExternalFilesDir(null), "models/$stamp")
         outputDir.mkdirs()
-        val objFile = File(outputDir, "model.obj")
-        val glbFile = File(outputDir, "model.glb")
 
-        _screen.value = Screen.Processing("Starting", 0f)
-        viewModelScope.launch {
-            val success = withContext(Dispatchers.Default) {
-                reconstructor.reconstruct(objFile.absolutePath, glbFile.absolutePath) { stage, value ->
-                    _screen.value = Screen.Processing(stage, value)
-                }
-            }
-            val message = reconstructor.lastMessage()
-            _screen.value = if (success && objFile.exists()) {
-                Screen.Result(objFile, glbFile, message.ifBlank { "Model ready" })
-            } else {
-                Screen.Failed(message.ifBlank { "Reconstruction failed" })
-            }
-        }
+        ReconstructionService.start(
+            context = getApplication<Application>(),
+            objFile = File(outputDir, "model.obj"),
+            glbFile = File(outputDir, "model.glb"),
+        )
     }
 
     fun cancelReconstruction() {
-        reconstructor.cancel()
+        ReconstructionEngine.cancel()
     }
 
     fun backToCapture(freshSession: Boolean) {
+        ReconstructionEngine.acknowledge()
         if (freshSession) {
-            reconstructor.close()
+            ReconstructionEngine.resetSession(workDir, optionsFor(_quality.value))
             coverage.reset()
             capture.reset()
-            openSession()
             _overlay.value = CaptureController.Overlay()
         }
-        _screen.value = Screen.Capture
     }
 
-    override fun onCleared() {
-        reconstructor.cancel()
-        reconstructor.close()
-        super.onCleared()
-    }
+    // Deliberately no cleanup of the native session here: it outlives this
+    // ViewModel so a reconstruction survives the Activity being destroyed.
 }

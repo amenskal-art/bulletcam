@@ -40,6 +40,9 @@ class CaptureController(
         val subjectScreen: FloatArray? = null,
         val motionBlurRisk: Boolean = false,
         val lastRejectReason: String? = null,
+        /** Three great circles of the capture volume, projected to the screen. */
+        val volumePoints: FloatArray = FloatArray(0),
+        val subjectRadius: Float = 0f,
     ) {
         // Data class equality on arrays compares identity, which is what we want
         // here: a new frame always allocates new arrays, so state always differs.
@@ -55,6 +58,28 @@ class CaptureController(
     var autoCapture: Boolean = true
     var minSeparationDegrees: Float = 8f
     var minSharpness: Float = 12f
+
+    /**
+     * Radius of the ball the reconstruction is restricted to. Anything outside
+     * it is never matched, never fused and never surfaced.
+     */
+    var subjectRadius: Float = DEFAULT_SUBJECT_RADIUS
+        private set
+
+    fun adjustRadius(delta: Float) {
+        subjectRadius = (subjectRadius + delta).coerceIn(MIN_RADIUS, MAX_RADIUS)
+        pushSubjectVolume()
+    }
+
+    /** Hands the current volume to the native side. Safe to call repeatedly. */
+    fun pushSubjectVolume() {
+        val target = subject
+        if (target == null) {
+            reconstructor.clearSubjectVolume()
+        } else {
+            reconstructor.setSubjectVolume(target[0], target[1], target[2], subjectRadius)
+        }
+    }
 
     private var lastPosition: FloatArray? = null
     private var lastTimestamp = 0L
@@ -81,6 +106,7 @@ class CaptureController(
 
     fun clearSubject() {
         subject = null
+        pushSubjectVolume()
     }
 
     fun reset() {
@@ -88,6 +114,7 @@ class CaptureController(
         subject = null
         lastPosition = null
         lastReject = null
+        pushSubjectVolume()
     }
 
     /**
@@ -116,6 +143,7 @@ class CaptureController(
         pendingSubjectTap?.let { tap ->
             subject = resolveSubject(frame, camera, tap)
             pendingSubjectTap = null
+            pushSubjectVolume()
         }
 
         camera.getViewMatrix(viewMatrix, 0)
@@ -128,6 +156,7 @@ class CaptureController(
         var ringPoints = FloatArray(0)
         var ringCovered = BooleanArray(0)
         var subjectScreen: FloatArray? = null
+        var volumePoints = FloatArray(0)
 
         if (target != null) {
             val toCamera = OrbitCoverage.normalise(
@@ -152,6 +181,7 @@ class CaptureController(
             ringPoints = projection.first
             ringCovered = projection.second
             subjectScreen = projectPoint(target, viewportWidth, viewportHeight)
+            volumePoints = projectVolume(target, viewportWidth, viewportHeight)
 
             hint = when {
                 reconstructor.frameCount() < MIN_FRAMES ->
@@ -176,6 +206,8 @@ class CaptureController(
             subjectScreen = subjectScreen,
             motionBlurRisk = speedMetersPerSecond > MAX_SPEED,
             lastRejectReason = lastReject,
+            volumePoints = volumePoints,
+            subjectRadius = subjectRadius,
         )
     }
 
@@ -310,6 +342,38 @@ class CaptureController(
         return points to covered
     }
 
+    /**
+     * Three orthogonal great circles of the capture volume. Drawing the actual
+     * masked region beats an abstract indicator: the operator can see whether
+     * the object is fully enclosed before spending two minutes finding out.
+     */
+    private fun projectVolume(target: FloatArray, width: Int, height: Int): FloatArray {
+        val samples = VOLUME_SAMPLES
+        val out = FloatArray(3 * samples * 2)
+        for (circle in 0 until 3) {
+            for (i in 0 until samples) {
+                val a = 2.0 * Math.PI * i / samples
+                val c = (kotlin.math.cos(a) * subjectRadius).toFloat()
+                val s = (kotlin.math.sin(a) * subjectRadius).toFloat()
+                val world = when (circle) {
+                    0 -> floatArrayOf(target[0] + c, target[1] + s, target[2])
+                    1 -> floatArrayOf(target[0], target[1] + c, target[2] + s)
+                    else -> floatArrayOf(target[0] + c, target[1], target[2] + s)
+                }
+                val screen = projectPoint(world, width, height)
+                val base = (circle * samples + i) * 2
+                if (screen == null) {
+                    out[base] = Float.NaN
+                    out[base + 1] = Float.NaN
+                } else {
+                    out[base] = screen[0]
+                    out[base + 1] = screen[1]
+                }
+            }
+        }
+        return out
+    }
+
     private fun projectPoint(world: FloatArray, width: Int, height: Int): FloatArray? {
         worldPoint[0] = world[0]
         worldPoint[1] = world[1]
@@ -334,6 +398,11 @@ class CaptureController(
         private const val RING_SAMPLES = 96
         private const val RING_ELEVATION_DEGREES = 18f
         private const val DEFAULT_SUBJECT_DISTANCE = 0.45f
+        private const val DEFAULT_SUBJECT_RADIUS = 0.15f
+        private const val MIN_RADIUS = 0.03f
+        private const val MAX_RADIUS = 1.2f
+        const val RADIUS_STEP = 0.02f
+        const val VOLUME_SAMPLES = 48
         private const val MAX_SPEED = 0.45f
         const val MIN_FRAMES = 18
 

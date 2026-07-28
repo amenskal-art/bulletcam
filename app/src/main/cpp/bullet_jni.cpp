@@ -116,6 +116,23 @@ JNIEXPORT jfloat JNICALL Java_com_bulletcam_capture_nativebridge_NativeReconstru
                                     pose, k, minSharpness);
 }
 
+/**
+ * Sets the region of interest around the subject. Radius <= 0 clears the mask
+ * and reconstructs the whole scene. Safe to call between captures; it only
+ * affects the reconstruction pass.
+ */
+JNIEXPORT void JNICALL
+Java_com_bulletcam_capture_nativebridge_NativeReconstructor_nativeSetSubjectVolume(
+    JNIEnv*, jobject, jlong handle, jfloat centerX, jfloat centerY, jfloat centerZ,
+    jfloat radius) {
+    Session* session = asSession(handle);
+    if (!session || !session->store) return;
+    SubjectVolume volume;
+    volume.center = {centerX, centerY, centerZ};
+    volume.radius = radius;
+    session->store->mutableOptions().subject = volume;
+}
+
 JNIEXPORT jint JNICALL Java_com_bulletcam_capture_nativebridge_NativeReconstructor_nativeFrameCount(
     JNIEnv*, jobject, jlong handle) {
     Session* session = asSession(handle);

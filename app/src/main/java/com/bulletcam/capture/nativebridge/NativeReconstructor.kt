@@ -106,6 +106,26 @@ class NativeReconstructor : AutoCloseable {
         )
     }
 
+    /**
+     * Restricts the reconstruction to a ball around the subject, in ARCore world
+     * coordinates. A radius of 0 clears the mask and reconstructs everything.
+     *
+     * This is not just a crop of the result. Dense stereo skips pixels whose ray
+     * misses the ball entirely, and for the ones that hit it searches only the
+     * depth interval between the two intersections rather than the whole scene
+     * range - so the mask makes the expensive stage both faster and better
+     * conditioned. It also keeps the Poisson grid and the voxel size scaled to
+     * the object instead of the room.
+     */
+    fun setSubjectVolume(centerX: Float, centerY: Float, centerZ: Float, radius: Float) {
+        if (handle == 0L) return
+        nativeSetSubjectVolume(handle, centerX, centerY, centerZ, radius)
+    }
+
+    fun clearSubjectVolume() {
+        if (handle != 0L) nativeSetSubjectVolume(handle, 0f, 0f, 0f, 0f)
+    }
+
     fun frameCount(): Int = if (handle == 0L) 0 else nativeFrameCount(handle)
 
     fun discardAll() {
@@ -149,6 +169,14 @@ class NativeReconstructor : AutoCloseable {
         intrinsics: FloatArray,
         minSharpness: Float,
     ): Float
+
+    private external fun nativeSetSubjectVolume(
+        handle: Long,
+        centerX: Float,
+        centerY: Float,
+        centerZ: Float,
+        radius: Float,
+    )
 
     private external fun nativeFrameCount(handle: Long): Int
     private external fun nativeReset(handle: Long)

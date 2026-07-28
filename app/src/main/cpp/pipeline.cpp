@@ -37,14 +37,22 @@ ReconstructionResult runReconstruction(FrameStore& store, const std::string& obj
     if (viewCount < 8)
         return failure("Capture at least 8 photos from different angles before reconstructing.");
 
+    if (options.subject.enabled()) {
+        BC_LOGI("Subject mask: r=%.3f m at (%.3f, %.3f, %.3f)", options.subject.radius,
+                options.subject.center.x, options.subject.center.y, options.subject.center.z);
+    }
+
     // --- 1. Sparse alignment ------------------------------------------------
     progress.setStage("Aligning captures", 0.f, 0.12f);
     SparseMap sparse = buildSparseMap(store, progress);
     if (progress.cancelled()) return failure("Cancelled");
     if (sparse.points.size() < 200)
         return failure(
-            "Not enough overlap between photos. Orbit more slowly and keep the object filling the "
-            "frame.");
+            options.subject.enabled()
+                ? "Not enough detail inside the capture volume. Grow the volume so it covers the "
+                  "whole object, or orbit more slowly."
+                : "Not enough overlap between photos. Orbit more slowly and keep the object "
+                  "filling the frame.");
     BC_LOGI("Sparse alignment: %zu points in %.1fs", sparse.points.size(), elapsedSeconds(start));
 
     // --- 2. View graph ------------------------------------------------------

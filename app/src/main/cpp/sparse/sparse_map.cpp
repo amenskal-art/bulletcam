@@ -149,6 +149,7 @@ SparseMap buildSparseMap(FrameStore& store, Progress& progress) {
     std::mutex resultMutex;
     const float minAngle = store.options().minTriangulationAngleDeg;
     const float maxAngle = store.options().maxTriangulationAngleDeg;
+    const SubjectVolume& subject = store.options().subject;
 
     parallelFor(static_cast<int>(pairs.size()), [&](int p) {
         const int i = pairs[static_cast<size_t>(p)].first;
@@ -197,6 +198,9 @@ SparseMap buildSparseMap(FrameStore& store, Progress& progress) {
             if (!triangulateRays(vi, vj, {ka.x, ka.y}, {kb.x, kb.y}, minAngle, maxAngle, point,
                                  angle))
                 continue;
+            // Background features triangulate perfectly well; they just are not
+            // what the operator asked for.
+            if (!subject.contains(point)) continue;
 
             SparsePoint sp;
             sp.position = point;

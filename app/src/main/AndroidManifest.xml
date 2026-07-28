@@ -5,6 +5,13 @@
          android.permission.INTERNET declaration anywhere in this project. -->
     <uses-permission android:name="android.permission.CAMERA" />
 
+    <!-- Reconstruction runs for minutes; a foreground service is the supported
+         way to keep it alive once the app is no longer visible. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
     <uses-feature android:name="android.hardware.camera2.full" android:required="false" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
@@ -32,6 +39,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".recon.ReconstructionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

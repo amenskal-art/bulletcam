@@ -52,6 +52,9 @@ YUV_420_888 planes   ─┘      2. view selection        co-visibility x baseli
   crossed with 3 elevation bands. The AR ring around the subject lights up as
   each sector is filled, and the strip at the top of the screen shows the same
   thing in a glance.
+- **A capture volume, not just a point.** Tapping sets the centre; the +/- control
+  sets the radius, and the ball is drawn in AR so you can confirm the object is
+  fully enclosed before committing to a run. Everything outside it is discarded.
 - **Blur rejection.** Every candidate frame is scored by the variance of its
   Laplacian on the native side and dropped if it is soft. Frames captured while
   the phone is moving too fast are skipped before they are even converted.
@@ -62,6 +65,72 @@ YUV_420_888 planes   ─┘      2. view selection        co-visibility x baseli
   `CONTROL_AE_LOCK`, `CONTROL_AWB_LOCK` and a pinned `LENS_FOCUS_DISTANCE` can
   hold one photometric calibration for the whole orbit. Devices that refuse the
   interop path fall back to a plain ARCore session automatically.
+
+  Note that the session uses `FocusMode.AUTO`, not `FIXED`. ARCore's `FIXED`
+  parks the lens at infinity, which is the right call for world tracking and the
+  wrong one for an object half a metre away. Autofocus finds the subject and the
+  lock then pins whatever distance it settled on.
+
+  ARCore forbids calling `setRepeatingRequest` while it is active, so toggling
+  the lock is deferred to the GL thread, where it is sandwiched between an ARCore
+  pause and resume with no frame update in flight.
+
+## Subject masking
+
+The capture UI already knows where the object is, so the reconstruction has no
+reason to spend time on the table, the wall, or the room behind. The tapped
+anchor and its radius become a ball in ARCore world coordinates that is pushed
+down to the native side before a run.
+
+This is not a crop of the result. The ball is projected into every view, and each
+pixel gets one of two outcomes:
+
+- the ray misses it, and dense stereo never touches that pixel at all;
+- the ray crosses it, and the search is confined to the depth interval between
+  the two intersections - a shell a few centimetres thick instead of the whole
+  scene depth range.
+
+Sparse triangulation and depth fusion apply the same containment test, so
+background geometry never reaches the surfacing stage.
+
+The accuracy gain turns out to be larger than the speed gain, because the Poisson
+grid resolution and the voxel size are both derived from the scene bounding box.
+Cropping to the object spends all of that resolution on the object. Measured on
+the synthetic scene below, a 150 mm sphere sitting on a 1 m tabletop, 20 views:
+
+| | wall clock | median radial error | triangles on the subject | voxel |
+|---|---|---|---|---|
+| whole scene | 25 s | 3.26 mm | 54k, shared with the table | 1.9 mm |
+| masked | 17 s | **0.57 mm** | **180k** | 0.8 mm |
+
+The exported bounding box comes out at 299 x 254 x 299 mm against a true diameter
+of 300 mm - the tabletop is gone entirely. The Y extent is short because the
+underside of the sphere is never visible from an orbit above the table.
+
+Leaving the subject unset simply clears the mask and reconstructs the whole
+scene.
+
+## Running in the background
+
+A reconstruction takes minutes, and Android freezes ordinary background work
+within seconds of an app losing visibility. The job therefore does not live in a
+ViewModel - it lives in a process-scoped `ReconstructionEngine`, held up by a
+`dataSync` foreground service with a progress notification and a partial wake
+lock.
+
+What that buys:
+
+- leave the app, lock the screen, use something else; the run continues and the
+  notification tracks the stage and percentage, with a Cancel action;
+- come back from recents and the UI reattaches to the run in progress, even if
+  the Activity was destroyed and rebuilt, because the screen state is derived
+  from the engine rather than stored in the ViewModel;
+- ARCore is shut down for the duration. Holding the camera open would cost frame
+  time and battery for a preview nobody is looking at, and competing with a
+  saturated CPU is the fastest way to make tracking judder on the way back.
+
+Notification permission is asked for once and never blocks anything: if it is
+denied the service still runs, the notification is just not shown.
 
 ## The reconstruction core
 
@@ -98,10 +167,13 @@ surface.
 cmake -S tools/host_test -B build/host -DCMAKE_BUILD_TYPE=Release
 cmake --build build/host --parallel
 ./build/host/bulletcam_host_test /tmp/bulletcam_test
+
+# same scene with the subject mask off, for comparison
+./build/host/bulletcam_host_test /tmp/bulletcam_nomask nomask
 ```
 
 A passing run reports a median radial error under 3 mm; the reference run lands
-around 0.7 mm. CI runs this before it builds the APK.
+around 0.6 mm. CI runs this before it builds the APK.
 
 ## Building
 
@@ -162,8 +234,8 @@ tools/host_test/           host-side regression test for the core
 
 - The shared-camera exposure-lock path follows Google's `SharedCameraActivity`
   ordering but has not been verified on physical hardware; it is written to fail
-  soft, and a device that rejects it drops to a plain ARCore session with fixed
-  focus.
+  soft, and a device that rejects it drops to a plain ARCore session that still
+  autofocuses on the subject, just without the lock.
 - Frame conversion runs on the GL thread when the shutter fires, which drops one
   preview frame per capture. Reconstruction itself runs on `Dispatchers.Default`
   and never touches the UI thread.
