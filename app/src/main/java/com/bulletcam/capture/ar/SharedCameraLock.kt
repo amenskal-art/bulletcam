@@ -77,13 +77,30 @@ class SharedCameraLock(
 
     /**
      * Freezes exposure, white balance and focus at whatever the auto algorithms
-     * have converged on. Call once the subject is framed and before the first
-     * capture; the whole photo set then shares one photometric calibration.
+     * have converged on, so the whole photo set shares one photometric
+     * calibration.
+     *
+     * ARCore forbids calling setRepeatingRequest while it is active, so the
+     * caller must pause the ARCore session around this call. ArSessionController
+     * does that on the GL thread between frames.
      */
-    fun setLocked(shouldLock: Boolean) {
+    fun applyLock(shouldLock: Boolean) {
         if (locked == shouldLock) return
         locked = shouldLock
         applyRequest()
+    }
+
+    /**
+     * Hands the capture callback to ARCore once it takes over the repeating
+     * request. Without this the app stops seeing capture metadata - including
+     * the focus distance the lock needs to pin - the moment ARCore resumes.
+     */
+    fun onArCoreResumed() {
+        try {
+            session.sharedCamera.setCaptureCallback(captureCallback, handler)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not register the ARCore capture callback", t)
+        }
     }
 
     private fun applyRequest() {
@@ -101,11 +118,8 @@ class SharedCameraLock(
             )
         }
         try {
-            target.setRepeatingRequest(
-                builder.build(),
-                session.sharedCamera.createARCaptureCallback(captureCallback, handler),
-                handler,
-            )
+            // Legal here only because ARCore is paused; see applyLock.
+            target.setRepeatingRequest(builder.build(), captureCallback, handler)
         } catch (t: Throwable) {
             Log.w(TAG, "Could not update the repeating request", t)
         }
