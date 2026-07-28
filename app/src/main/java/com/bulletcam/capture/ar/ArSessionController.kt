@@ -53,7 +53,19 @@ class ArSessionController(
     private var viewportChanged = false
     private var displayRotation = 0
     private var sharedCameraActive = false
+
+    @Volatile
     private var arCoreResumed = false
+
+    /**
+     * Exposure-lock change waiting to be applied. ARCore forbids touching the
+     * repeating request while it is active, so the swap is deferred to the GL
+     * thread where it can be sandwiched between an ARCore pause and resume with
+     * no frame update in flight.
+     */
+    @Volatile
+    private var pendingExposureLock: Boolean? = null
+
     private var glReady = false
 
     /** Image size of the frames handed to the reconstruction core. */
@@ -95,8 +107,11 @@ class ArSessionController(
         }
 
         val config = Config(target).apply {
-            // Fixed focus keeps the intrinsics constant across the whole orbit.
-            focusMode = Config.FocusMode.FIXED
+            // ARCore's FIXED mode parks the lens at infinity, which is right for
+            // world tracking and wrong for an object half a metre away. Let
+            // autofocus find the subject; SharedCameraLock then pins the focus
+            // distance it settled on so it cannot drift mid-orbit.
+            focusMode = Config.FocusMode.AUTO
             planeFindingMode = Config.PlaneFindingMode.DISABLED
             lightEstimationMode = Config.LightEstimationMode.DISABLED
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
@@ -125,6 +140,7 @@ class ArSessionController(
         try {
             target.resume()
             arCoreResumed = true
+            cameraLock?.onArCoreResumed()
         } catch (t: Throwable) {
             Log.e(TAG, "Session resume failed", t)
             listener.onSessionMessage("Could not start the camera: ${t.message}")
@@ -181,8 +197,42 @@ class ArSessionController(
     /** Freezes exposure, white balance and focus for the rest of the session. */
     fun setExposureLocked(locked: Boolean) {
         exposureLocked = locked
-        cameraLock?.setLocked(locked)
-        listener.onExposureLockChanged(locked, cameraLock != null)
+        if (cameraLock == null) {
+            listener.onExposureLockChanged(locked, false)
+            return
+        }
+        // Picked up by the GL thread on the next frame.
+        pendingExposureLock = locked
+    }
+
+    /** Runs on the GL thread. Returns true if the caller should skip this frame. */
+    private fun applyPendingExposureLock(target: Session): Boolean {
+        // Leave the request queued until ARCore is actually running, otherwise
+        // the pause/resume pair below would start it too early.
+        if (!arCoreResumed) return false
+        val requested = pendingExposureLock ?: return false
+        pendingExposureLock = null
+        val lock = cameraLock ?: return false
+        try {
+            // ARCore has to let go of the repeating request before Camera2 may
+            // change it, so pause, swap, and resume.
+            arCoreResumed = false
+            target.pause()
+            lock.applyLock(requested)
+            target.resume()
+            arCoreResumed = true
+            lock.onArCoreResumed()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Exposure lock change failed", t)
+            try {
+                target.resume()
+                arCoreResumed = true
+            } catch (ignored: Throwable) {
+                arCoreResumed = false
+            }
+        }
+        activity.runOnUiThread { listener.onExposureLockChanged(requested, true) }
+        return true
     }
 
     fun pause() {
@@ -250,6 +300,7 @@ class ArSessionController(
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         val target = session ?: return
+        if (applyPendingExposureLock(target)) return
         if (!arCoreResumed) return
 
         if (viewportChanged) {
