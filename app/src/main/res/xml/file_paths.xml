@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Finished models live under getExternalFilesDir()/models so they survive
+         an app update and can be handed to other apps through the provider. -->
+    <external-files-path name="models" path="models/" />
+    <files-path name="internal_models" path="models/" />
+</paths>
