@@ -1,0 +1,170 @@
+name: Android CI
+
+# Documentation-only changes must not spend a build slot: the paths-ignore list
+# below keeps Markdown, licence and asset edits from triggering a compile.
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+  pull_request:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 27.0.12077973
+  CMAKE_VERSION: 3.22.1
+
+jobs:
+  # Exercises the reconstruction core on the host before spending time on the
+  # APK: it renders a synthetic orbit around a sphere of known size and checks
+  # the exported mesh lands within tolerance of the true surface.
+  native-regression:
+    name: Reconstruction core regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build zlib1g-dev
+
+      - name: Configure
+        run: cmake -S tools/host_test -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/host --parallel
+
+      - name: Run synthetic scene
+        run: ./build/host/bulletcam_host_test "${RUNNER_TEMP}/bulletcam_test"
+
+      - name: Upload reconstructed model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-test-model
+          path: |
+            ${{ runner.temp }}/bulletcam_test/model.obj
+            ${{ runner.temp }}/bulletcam_test/model.mtl
+            ${{ runner.temp }}/bulletcam_test/model.png
+            ${{ runner.temp }}/bulletcam_test/model.glb
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build:
+    name: assembleDebug
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Gradle's own caches: dependency jars, transforms and the wrapper
+      # distribution. Keyed on the build scripts so a dependency bump busts it.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # The NDK is a slow download, so it gets its own cache keyed only on the
+      # version pinned above.
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+          key: ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
+      - name: Install NDK and CMake
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          yes | sdkmanager --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" > /dev/null
+
+      # Native object files, keyed on every C++ source plus the scripts that
+      # affect how they are compiled. A UI-only change leaves this key untouched,
+      # so the C++ never gets rebuilt.
+      - name: Cache native build
+        id: cxx-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/.cxx
+            app/build/intermediates/cxx
+          key: cxx-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ hashFiles('app/src/main/cpp/**/*.cpp', 'app/src/main/cpp/**/*.h', 'app/src/main/cpp/CMakeLists.txt', 'app/build.gradle.kts') }}
+          restore-keys: |
+            cxx-${{ runner.os }}-${{ env.NDK_VERSION }}-
+
+      # Ninja decides what to rebuild from timestamps, and a fresh checkout gives
+      # every source a brand new mtime. On an exact cache hit the sources are
+      # byte-identical to the ones that produced the cached objects, so backdating
+      # them is safe and is what actually makes the cache save any work.
+      - name: Mark cached native sources as up to date
+        if: steps.cxx-cache.outputs.cache-hit == 'true'
+        run: find app/src/main/cpp -type f -exec touch -t 200001010000 {} +
+
+      # The wrapper jar is a binary and may not be committed; regenerate it with
+      # the Gradle already on the runner if it is missing.
+      - name: Ensure the Gradle wrapper is present
+        run: |
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper --gradle-version 8.9 --distribution-type bin
+          fi
+          chmod +x gradlew
+
+      - name: Assemble debug APK
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bulletcam-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload native build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-log
+          path: |
+            app/.cxx/**/*.log
+            app/build/reports/**
+          if-no-files-found: ignore
